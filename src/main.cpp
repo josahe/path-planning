@@ -20,11 +20,6 @@ enum STATES {
   RIGHT_LANE_CHANGE // execute a lane change right
 };
 
-struct TARGET_CAR {
- double id;
- double d;
-};
-
 // for convenience
 using json = nlohmann::json;
 
@@ -275,11 +270,12 @@ int main() {
             }
 
             bool too_close = false;
+            bool check_turn = false;
             bool can_turn_left = true;
             bool can_turn_right = true;
 
-            double safe_dist_front = 20;
-            double safe_dist_back = 5;
+            double safe_dist_front = 30;
+            double safe_dist_back = 10;
 
             if (lane == 0) {
               can_turn_left = false;
@@ -287,7 +283,7 @@ int main() {
               can_turn_right = false;
             }
 
-            //find ref_v to use
+            //identify the state of traffic to set flags that guides the fsm
             for (int i = 0; i < sensor_fusion.size(); ++i) {
               float d = sensor_fusion[i][6];
               double vx = sensor_fusion[i][3];
@@ -301,10 +297,22 @@ int main() {
               //if car is in my lane
               if (d < (2+4*lane+2) && d > (2+4*lane-2)) {
                 //check s values greater than mine and less than gap
-                if ((check_car_s > car_s) &&
-                    (check_car_s < (car_s + safe_dist_front))) {
-                  too_close = true;
-                  target_vel = 30;
+                if (check_car_s > car_s) {
+                  if (check_car_s < (car_s + safe_dist_front-20)) {
+                    too_close = true;
+                    target_vel = 0;
+                  } else if (check_car_s < (car_s + safe_dist_front-15)) {
+                    too_close = true;
+                    target_vel = 10;
+                  } else if (check_car_s < (car_s + safe_dist_front-10)) {
+                    too_close = true;
+                    target_vel = 20;
+                  } else if (check_car_s < (car_s + safe_dist_front-5)) {
+                    too_close = true;
+                    target_vel = 30;
+                  } else if (check_car_s < (car_s + safe_dist_front)) {
+                    check_turn = true;
+                  }
                 }
               }
 
@@ -325,10 +333,6 @@ int main() {
                   can_turn_right = false;
                 }
               }
-
-              // break early if all flags raised
-              if (too_close && !can_turn_left && !can_turn_right)
-                break;
             }
 
             // Finite state machine section //
@@ -339,23 +343,22 @@ int main() {
             switch (current_state) {
               // stay in lane, safe distance from car infront
               case KEEP_LANE:
-                if (too_close) {
-                  next_state = CHECK_LANE_CHANGE;
-                } else {
+                if (!too_close)
                   target_vel = 49.5;
+                if (check_turn)
+                  next_state = CHECK_LANE_CHANGE;
+                else
                   next_state = KEEP_LANE;
-                }
                 break;
 
               // check surrounding lanes and decided next state
               case CHECK_LANE_CHANGE:
-                if (can_turn_left) {
+                if (can_turn_left)
                   next_state = LEFT_LANE_CHANGE;
-                } else if (can_turn_right) {
+                else if (can_turn_right)
                   next_state = RIGHT_LANE_CHANGE;
-                } else {
+                else
                   next_state = KEEP_LANE;
-                }
                 break;
 
               // execute a lane change left
@@ -371,13 +374,10 @@ int main() {
                 break;
 
               default:
-                cout << "Illegal state" << endl;
                 throw std::runtime_error("Illegal state");
             }
 
             current_state = next_state;
-
-            cout << "Target velocity = " << target_vel << endl;
 
             // Waypoint generation section //
             // --------------------------- //
@@ -389,6 +389,9 @@ int main() {
             double ref_y = car_y;
             double ref_yaw = deg2rad(car_yaw);
 
+            //take points from previous path to avoid discontinuities.
+            //first cycle will have no previous points, so project backwards
+            //based on car heading.
             if (prev_size < 2) {
               double prev_car_x = car_x - cos(car_yaw);
               double prev_car_y = car_y - sin(car_yaw);
@@ -436,26 +439,34 @@ int main() {
               ptsy[i] = shift_x * sin(0-ref_yaw) + shift_y * cos(0-ref_yaw);
             }
 
+            //create spline object
             tk::spline s;
 
+            //set xy points to spline
             s.set_points(ptsx, ptsy);
 
+            //new future values to generate
             vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+            //reuse previous points not consumed by simulator
             for (int i = 0; i < previous_path_x.size(); ++i) {
               next_x_vals.push_back(previous_path_x[i]);
               next_y_vals.push_back(previous_path_y[i]);
             }
 
-            double target_x = 30;
+            //set an x target, use spline to give a y target, then calculate
+            //the distance to that point in a straight line.
+            double target_x = 30; // 30 meter horizon
             double target_y = s(target_x);
             double target_dist = sqrt(pow(target_x, 2) + pow(target_y, 2));
 
             double x_add_on = 0;
 
+            //calculate the remaining future values up to a total of 50 points
             for (int i = 1; i <= 50-previous_path_x.size(); ++i) {
 
+              //for every point if not at target velocity update reference velocity
               if (ref_vel < target_vel) {
                 ref_vel += .2;
               }
@@ -463,7 +474,8 @@ int main() {
                 ref_vel -= .2;
               }
 
-              double N = target_dist / (.02 * ref_vel/2.24);
+              // calculate the distance N to travel at desired reference velocity
+              double N = target_dist / (.02 * ref_vel/2.24);//2.24 converts MPH to m/s
               double x_point = x_add_on + target_x/N;
               double y_point = s(x_point);
               x_add_on = x_point;
@@ -471,12 +483,12 @@ int main() {
               double x_ref = x_point;
               double y_ref = y_point;
 
+              //convert back to map coordinates
               x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
               y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
 
               x_point += ref_x;
               y_point += ref_y;
-
 
               next_x_vals.push_back(x_point);
               next_y_vals.push_back(y_point);
